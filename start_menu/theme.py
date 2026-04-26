@@ -116,6 +116,40 @@ def build_stylesheet(theme, surface_opacity):
         QLabel#helperLabel {{
             color: {helper_text};
         }}
+        QScrollArea#sectionsScrollArea {{
+            border: none;
+            background: transparent;
+        }}
+        QWidget#groupSection {{
+            background: transparent;
+        }}
+        QWidget#groupHeader {{
+            background: {launcher_panel_bg};
+            border: 1px solid {border};
+            border-radius: 14px;
+        }}
+        QPushButton#groupToggleButton {{
+            min-height: 26px;
+            max-height: 26px;
+            min-width: 24px;
+            padding: 0;
+            font-size: 16px;
+        }}
+        QLabel#groupTitleLabel {{
+            font-size: 15px;
+            font-weight: 700;
+            color: {text};
+        }}
+        QLabel#groupCountLabel {{
+            color: {helper_text};
+        }}
+        QLabel#groupEmptyLabel {{
+            color: {helper_text};
+            border: 1px dashed {border};
+            border-radius: 12px;
+            min-height: 52px;
+            background: {launcher_panel_bg};
+        }}
         QListWidget {{
             background: {panel_bg};
             color: {text};

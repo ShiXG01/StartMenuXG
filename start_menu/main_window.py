@@ -1,5 +1,7 @@
 import ctypes
+import json
 import sys
+import uuid
 from pathlib import Path
 
 from PySide6.QtCore import QFileInfo, QEvent, QTimer, Qt, QSize, Signal
@@ -16,10 +18,14 @@ from PySide6.QtGui import (
     QShortcut,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QApplication,
+    QAbstractItemView,
     QDialog,
+    QFrame,
     QFileIconProvider,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
     QLineEdit,
     QListView,
     QListWidget,
@@ -27,12 +33,12 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
-    QHBoxLayout,
     QWidget,
-    QLabel,
 )
 
+from start_menu.config import MenuLayoutGroup
 from start_menu.hotkey import GlobalHotkeyManager
 from start_menu.scanner import open_path, scan_menu_directory
 from start_menu.settings_dialog import SettingsDialog
@@ -40,6 +46,8 @@ from start_menu.theme import build_stylesheet, get_system_theme
 
 
 IS_WINDOWS = sys.platform.startswith("win")
+MIME_TILE = "application/x-startmenuxg-tile"
+ROOT_GROUP_ID = "@root"
 
 if IS_WINDOWS:
     from ctypes import wintypes
@@ -51,6 +59,30 @@ if IS_WINDOWS:
             ("right", wintypes.LONG),
             ("bottom", wintypes.LONG),
         ]
+
+
+def _encode_drag_payload(item_key, source_group_id):
+    payload = {
+        "item_key": str(item_key or "").strip(),
+        "source_group_id": ROOT_GROUP_ID if source_group_id in (None, "") else str(source_group_id),
+    }
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def _decode_drag_payload(mime_data):
+    if not mime_data.hasFormat(MIME_TILE):
+        return None
+
+    try:
+        payload = json.loads(bytes(mime_data.data(MIME_TILE)).decode("utf-8"))
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return None
+
+    item_key = str(payload.get("item_key", "")).strip()
+    source_group_id = str(payload.get("source_group_id", ROOT_GROUP_ID)).strip() or ROOT_GROUP_ID
+    if not item_key:
+        return None
+    return item_key, source_group_id
 
 
 class BackgroundSurface(QWidget):
@@ -112,23 +144,62 @@ class BackgroundSurface(QWidget):
 
 
 class LauncherListWidget(QListWidget):
-    items_reordered = Signal()
+    move_requested = Signal(str, object, object, int)
+    selection_changed = Signal(object, str)
 
-    def __init__(self, parent=None):
+    def __init__(self, group_id, parent=None):
         super().__init__(parent)
-        self._drag_row = -1
+        self.group_id = group_id
+        self._reorder_enabled = True
+
+        self.setObjectName("launcherList")
+        self.setAlternatingRowColors(False)
+        self.setViewMode(QListView.IconMode)
+        self.setFlow(QListView.LeftToRight)
+        self.setMovement(QListView.Static)
+        self.setResizeMode(QListView.Adjust)
+        self.setWrapping(True)
+        self.setWordWrap(True)
+        self.setUniformItemSizes(True)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setTextElideMode(Qt.ElideRight)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.setDragEnabled(True)
+        self.viewport().setAcceptDrops(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+
+        self.currentItemChanged.connect(self._on_current_item_changed)
+
+    def set_group_id(self, group_id):
+        self.group_id = group_id
+
+    def set_reorder_enabled(self, enabled):
+        self._reorder_enabled = bool(enabled)
+        self.setDragEnabled(self._reorder_enabled)
+        self.viewport().setAcceptDrops(self._reorder_enabled)
+        self.setAcceptDrops(self._reorder_enabled)
+        self.setDropIndicatorShown(self._reorder_enabled)
 
     def startDrag(self, supported_actions):
         del supported_actions
+        if not self._reorder_enabled:
+            return
+
         item = self.currentItem()
         if item is None:
             return
 
-        self._drag_row = self.currentRow()
+        entry = item.data(Qt.UserRole)
+        if entry is None:
+            return
+
         mime_data = self.mimeData(self.selectedItems())
         if mime_data is None:
-            self._drag_row = -1
             return
+        mime_data.setData(MIME_TILE, _encode_drag_payload(entry.entry_key, self.group_id))
 
         drag = QDrag(self)
         drag.setMimeData(mime_data)
@@ -140,42 +211,33 @@ class LauncherListWidget(QListWidget):
             drag.setHotSpot(cursor_pos - item_rect.topLeft())
 
         drag.exec(Qt.MoveAction)
-        self._drag_row = -1
 
     def dragEnterEvent(self, event):
-        if event.source() is self:
+        payload = _decode_drag_payload(event.mimeData())
+        if self._reorder_enabled and payload is not None:
             event.setDropAction(Qt.MoveAction)
             event.accept()
             return
         super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event):
-        if event.source() is self:
+        payload = _decode_drag_payload(event.mimeData())
+        if self._reorder_enabled and payload is not None:
             event.setDropAction(Qt.MoveAction)
             event.accept()
             return
         super().dragMoveEvent(event)
 
     def dropEvent(self, event):
-        if event.source() is self and self._drag_row >= 0:
+        payload = _decode_drag_payload(event.mimeData())
+        if self._reorder_enabled and payload is not None:
+            item_key, source_group_id = payload
             target_row = self._drop_insert_row(event.position().toPoint())
-            source_row = self._drag_row
-            if target_row > source_row:
-                target_row -= 1
-
-            if target_row != source_row:
-                item = self.takeItem(source_row)
-                self.insertItem(target_row, item)
-                self.setCurrentRow(target_row)
-                self.viewport().update()
+            self.move_requested.emit(item_key, source_group_id, self.group_id, target_row)
             event.setDropAction(Qt.MoveAction)
             event.accept()
-            self.items_reordered.emit()
-            self._drag_row = -1
             return
-
         super().dropEvent(event)
-        self.items_reordered.emit()
 
     def _drop_insert_row(self, pos):
         count = self.count()
@@ -194,7 +256,7 @@ class LauncherListWidget(QListWidget):
         if relative_y < 0:
             return 0
 
-        column_count = self._column_count_for_drop(cell_width, origin_x)
+        column_count = self.column_count()
         row_index = max(0, relative_y // cell_height)
 
         if relative_x < 0:
@@ -210,10 +272,327 @@ class LauncherListWidget(QListWidget):
 
         return max(0, min(count, int(insert_row)))
 
-    def _column_count_for_drop(self, cell_width, origin_x):
+    def column_count(self):
+        grid_width = self.gridSize().width()
+        if grid_width <= 0:
+            return 1
         viewport_width = max(1, self.viewport().width())
-        usable_width = max(cell_width, viewport_width - max(0, origin_x))
-        return max(1, usable_width // cell_width)
+        return max(1, viewport_width // grid_width)
+
+    def update_height_to_contents(self):
+        count = self.count()
+        if count <= 0:
+            self.setFixedHeight(0)
+            return
+
+        rows = int((count + self.column_count() - 1) / self.column_count())
+        frame_height = self.frameWidth() * 2
+        content_height = rows * self.gridSize().height()
+        self.setFixedHeight(content_height + frame_height + 4)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update_height_to_contents()
+
+    def _on_current_item_changed(self, current, previous):
+        del previous
+        if current is None:
+            return
+        entry = current.data(Qt.UserRole)
+        if entry is None:
+            return
+        self.selection_changed.emit(self.group_id, entry.entry_key)
+
+
+class GroupHeaderWidget(QWidget):
+    toggle_requested = Signal(object)
+    rename_requested = Signal(object)
+    delete_requested = Signal(object)
+    move_requested = Signal(str, object, object, int)
+
+    def __init__(self, group_id, editable, collapsible, parent=None):
+        super().__init__(parent)
+        self.group_id = group_id
+        self.editable = editable
+        self.collapsible = collapsible
+        self._reorder_enabled = True
+        self._item_count = 0
+        self.setObjectName("groupHeader")
+        self.setAcceptDrops(True)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
+
+        self.toggle_button = QPushButton("▾" if collapsible else "")
+        self.toggle_button.setObjectName("groupToggleButton")
+        self.toggle_button.setFixedWidth(24)
+        self.toggle_button.setProperty("surfaceRole", "launcher")
+        self.toggle_button.clicked.connect(self._emit_toggle)
+        layout.addWidget(self.toggle_button)
+
+        self.title_label = QLabel()
+        self.title_label.setObjectName("groupTitleLabel")
+        layout.addWidget(self.title_label, 1)
+
+        self.count_label = QLabel()
+        self.count_label.setObjectName("groupCountLabel")
+        layout.addWidget(self.count_label)
+
+        self.rename_button = QPushButton("重命名")
+        self.rename_button.setProperty("surfaceRole", "launcher")
+        self.rename_button.clicked.connect(lambda: self.rename_requested.emit(self.group_id))
+        self.rename_button.setVisible(self.editable)
+        layout.addWidget(self.rename_button)
+
+        self.delete_button = QPushButton("删除")
+        self.delete_button.setProperty("surfaceRole", "launcher")
+        self.delete_button.clicked.connect(lambda: self.delete_requested.emit(self.group_id))
+        self.delete_button.setVisible(self.editable)
+        layout.addWidget(self.delete_button)
+
+        if not self.collapsible:
+            self.toggle_button.setEnabled(False)
+
+        for child in (
+            self,
+            self.toggle_button,
+            self.title_label,
+            self.count_label,
+            self.rename_button,
+            self.delete_button,
+        ):
+            child.setAcceptDrops(True)
+            if child is not self:
+                child.installEventFilter(self)
+
+    def set_state(self, title, item_count, collapsed):
+        self._item_count = max(0, int(item_count))
+        self.title_label.setText(title)
+        self.count_label.setText("{0} 项".format(self._item_count))
+        self.toggle_button.setText("▸" if collapsed else "▾")
+        self.toggle_button.setVisible(self.collapsible)
+
+    def set_reorder_enabled(self, enabled):
+        self._reorder_enabled = bool(enabled)
+
+    def dragEnterEvent(self, event):
+        if self._accept_drag_event(event):
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if self._accept_drag_event(event):
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        payload = _decode_drag_payload(event.mimeData())
+        if self._reorder_enabled and payload is not None:
+            item_key, source_group_id = payload
+            self.move_requested.emit(item_key, source_group_id, self.group_id, self._item_count)
+            event.setDropAction(Qt.MoveAction)
+            event.accept()
+            return
+        super().dropEvent(event)
+
+    def eventFilter(self, watched, event):
+        if watched in (
+            self.toggle_button,
+            self.title_label,
+            self.count_label,
+            self.rename_button,
+            self.delete_button,
+        ):
+            if event.type() == QEvent.Type.DragEnter and self._accept_drag_event(event):
+                return True
+            if event.type() == QEvent.Type.DragMove and self._accept_drag_event(event):
+                return True
+            if event.type() == QEvent.Type.Drop:
+                payload = _decode_drag_payload(event.mimeData())
+                if self._reorder_enabled and payload is not None:
+                    item_key, source_group_id = payload
+                    self.move_requested.emit(item_key, source_group_id, self.group_id, self._item_count)
+                    event.setDropAction(Qt.MoveAction)
+                    event.accept()
+                    return True
+        return super().eventFilter(watched, event)
+
+    def _accept_drag_event(self, event):
+        payload = _decode_drag_payload(event.mimeData())
+        if self._reorder_enabled and payload is not None:
+            event.setDropAction(Qt.MoveAction)
+            event.accept()
+            return True
+        return False
+
+    def _emit_toggle(self):
+        if self.collapsible:
+            self.toggle_requested.emit(self.group_id)
+
+
+class GroupSectionWidget(QWidget):
+    toggle_requested = Signal(object)
+    rename_requested = Signal(object)
+    delete_requested = Signal(object)
+    move_requested = Signal(str, object, object, int)
+    selection_changed = Signal(object, str)
+    item_activated = Signal(object)
+
+    def __init__(self, group_id, title, editable, collapsible, parent=None):
+        super().__init__(parent)
+        self.group_id = group_id
+        self._entries = []
+        self._collapsed = False
+
+        self.setObjectName("groupSection")
+        self.setAcceptDrops(True)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.header = GroupHeaderWidget(group_id, editable, collapsible)
+        self.header.set_state(title, 0, False)
+        self.header.toggle_requested.connect(lambda current_group_id: self.toggle_requested.emit(current_group_id))
+        self.header.rename_requested.connect(lambda current_group_id: self.rename_requested.emit(current_group_id))
+        self.header.delete_requested.connect(lambda current_group_id: self.delete_requested.emit(current_group_id))
+        self.header.move_requested.connect(
+            lambda item_key, source_group_id, target_group_id, target_row: self.move_requested.emit(
+                item_key,
+                source_group_id,
+                target_group_id,
+                target_row,
+            )
+        )
+        layout.addWidget(self.header)
+
+        self.tile_list = LauncherListWidget(group_id)
+        self.tile_list.move_requested.connect(
+            lambda item_key, source_group_id, target_group_id, target_row: self.move_requested.emit(
+                item_key,
+                source_group_id,
+                target_group_id,
+                target_row,
+            )
+        )
+        self.tile_list.selection_changed.connect(
+            lambda current_group_id, entry_key: self.selection_changed.emit(current_group_id, entry_key)
+        )
+        self.tile_list.itemActivated.connect(lambda item: self.item_activated.emit(item))
+        layout.addWidget(self.tile_list)
+
+        self.empty_label = QLabel("拖动磁贴到这里")
+        self.empty_label.setObjectName("groupEmptyLabel")
+        self.empty_label.setAlignment(Qt.AlignCenter)
+        self.empty_label.setAcceptDrops(True)
+        self.empty_label.installEventFilter(self)
+        self.empty_label.hide()
+        layout.addWidget(self.empty_label)
+
+    def populate(self, entries, icon_provider, icon_size, grid_size, collapsed, reorder_enabled):
+        self._entries = list(entries)
+        self._collapsed = bool(collapsed)
+        self.header.set_state(self.header.title_label.text(), len(self._entries), self._collapsed)
+        self.header.set_reorder_enabled(reorder_enabled)
+        self.tile_list.set_group_id(self.group_id)
+        self.tile_list.set_reorder_enabled(reorder_enabled)
+        self.tile_list.setIconSize(QSize(icon_size, icon_size))
+        self.tile_list.setGridSize(grid_size)
+        self.tile_list.setSpacing(6)
+        self.tile_list.clear()
+
+        for entry in self._entries:
+            item = QListWidgetItem(icon_provider(entry.path), entry.display_name)
+            item.setData(Qt.UserRole, entry)
+            item.setToolTip(str(entry.path))
+            item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
+            item.setSizeHint(grid_size)
+            self.tile_list.addItem(item)
+
+        self._apply_collapsed_state()
+        self.tile_list.update_height_to_contents()
+
+    def set_title(self, title):
+        self.header.title_label.setText(title)
+
+    def set_selected_entry(self, entry_key):
+        target_key = str(entry_key or "").strip().casefold()
+        for index in range(self.tile_list.count()):
+            item = self.tile_list.item(index)
+            entry = item.data(Qt.UserRole)
+            if entry is None:
+                continue
+            if entry.entry_key.casefold() == target_key:
+                self.tile_list.setCurrentRow(index)
+                return True
+        self.tile_list.clearSelection()
+        self.tile_list.setCurrentItem(None)
+        return False
+
+    def clear_selection(self):
+        self.tile_list.blockSignals(True)
+        try:
+            self.tile_list.clearSelection()
+            self.tile_list.setCurrentItem(None)
+        finally:
+            self.tile_list.blockSignals(False)
+
+    def scroll_selected_into_view(self):
+        item = self.tile_list.currentItem()
+        if item is not None:
+            self.tile_list.scrollToItem(item)
+
+    def entry_keys(self):
+        return [entry.entry_key for entry in self._entries]
+
+    def _apply_collapsed_state(self):
+        show_tiles = (not self._collapsed) and bool(self._entries)
+        self.tile_list.setVisible(show_tiles)
+        self.empty_label.setVisible((not self._collapsed) and not self._entries)
+
+    def dragEnterEvent(self, event):
+        if self._accept_drag_event(event):
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if self._accept_drag_event(event):
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        payload = _decode_drag_payload(event.mimeData())
+        if payload is not None:
+            item_key, source_group_id = payload
+            self.move_requested.emit(item_key, source_group_id, self.group_id, len(self._entries))
+            event.setDropAction(Qt.MoveAction)
+            event.accept()
+            return
+        super().dropEvent(event)
+
+    def eventFilter(self, watched, event):
+        if watched is self.empty_label:
+            if event.type() == QEvent.Type.DragEnter and self._accept_drag_event(event):
+                return True
+            if event.type() == QEvent.Type.DragMove and self._accept_drag_event(event):
+                return True
+            if event.type() == QEvent.Type.Drop:
+                payload = _decode_drag_payload(event.mimeData())
+                if payload is not None:
+                    item_key, source_group_id = payload
+                    self.move_requested.emit(item_key, source_group_id, self.group_id, len(self._entries))
+                    event.setDropAction(Qt.MoveAction)
+                    event.accept()
+                    return True
+        return super().eventFilter(watched, event)
+
+    def _accept_drag_event(self, event):
+        payload = _decode_drag_payload(event.mimeData())
+        if payload is not None:
+            event.setDropAction(Qt.MoveAction)
+            event.accept()
+            return True
+        return False
 
 
 class MainWindow(QMainWindow):
@@ -224,6 +603,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config_store = config_store
         self.config = self.config_store.load()
+        self.menu_layout = self.config_store.load_menu_layout()
         self.icon_provider = QFileIconProvider()
         self.hotkey_manager = GlobalHotkeyManager(
             self.hotkey_triggered.emit,
@@ -239,10 +619,15 @@ class MainWindow(QMainWindow):
         self._suspend_auto_hide = False
         self._theme_name = None
         self._all_entries = []
+        self._entry_map = {}
         self._drag_offset = None
+        self._section_widgets = {}
+        self._visible_item_order = []
+        self._selected_group_id = ROOT_GROUP_ID
+        self._selected_entry_key = None
 
         self.setWindowTitle("StartMenuXG")
-        self.setMinimumSize(400, 320)
+        self.setMinimumSize(460, 360)
         self.resize(self.config.window_width, self.config.window_height)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -262,9 +647,19 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(18, 18, 18, 18)
         root_layout.setSpacing(10)
 
+        top_row = QHBoxLayout()
+        top_row.setSpacing(8)
+
         self.status_label = QLabel("已加载 0 项")
         self.status_label.setObjectName("statusLabel")
-        root_layout.addWidget(self.status_label)
+        top_row.addWidget(self.status_label, 1)
+
+        new_group_button = QPushButton("新建分类")
+        new_group_button.setProperty("surfaceRole", "launcher")
+        new_group_button.clicked.connect(self.create_group)
+        top_row.addWidget(new_group_button)
+
+        root_layout.addLayout(top_row)
 
         self.search_input = QLineEdit()
         self.search_input.setObjectName("launcherSearchInput")
@@ -275,25 +670,21 @@ class MainWindow(QMainWindow):
         self.search_input.returnPressed.connect(self.open_selected)
         root_layout.addWidget(self.search_input)
 
-        self.list_widget = LauncherListWidget()
-        self.list_widget.setObjectName("launcherList")
-        self.list_widget.setAlternatingRowColors(False)
-        self.list_widget.setViewMode(QListView.IconMode)
-        self.list_widget.setFlow(QListView.LeftToRight)
-        self.list_widget.setMovement(QListView.Static)
-        self.list_widget.setResizeMode(QListView.Adjust)
-        self.list_widget.setWrapping(True)
-        self.list_widget.setWordWrap(True)
-        self.list_widget.setUniformItemSizes(True)
-        self.list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.list_widget.setDragDropOverwriteMode(False)
-        self.list_widget.setDropIndicatorShown(True)
-        self.list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.list_widget.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
-        self.list_widget.setTextElideMode(Qt.ElideRight)
-        self.list_widget.itemActivated.connect(self._open_item)
-        self.list_widget.items_reordered.connect(self._save_tile_order)
-        root_layout.addWidget(self.list_widget, 1)
+        self.sections_scroll = QScrollArea()
+        self.sections_scroll.setWidgetResizable(True)
+        self.sections_scroll.setObjectName("sectionsScrollArea")
+        self.sections_scroll.setFrameShape(QFrame.NoFrame)
+        self.sections_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.sections_scroll.setWidgetResizable(True)
+
+        self.sections_container = QWidget()
+        self.sections_container.setObjectName("sectionsContainer")
+        self.sections_layout = QVBoxLayout(self.sections_container)
+        self.sections_layout.setContentsMargins(0, 0, 0, 0)
+        self.sections_layout.setSpacing(12)
+        self.sections_layout.setAlignment(Qt.AlignTop)
+        self.sections_scroll.setWidget(self.sections_container)
+        root_layout.addWidget(self.sections_scroll, 1)
 
         button_row = QHBoxLayout()
         button_row.setSpacing(8)
@@ -330,7 +721,6 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Escape"), self, activated=self.hide_launcher)
         QShortcut(QKeySequence("F5"), self, activated=self.reload_items)
         self.setCentralWidget(self.surface)
-        self._configure_tile_list()
 
     def _contains_global_point(self, x, y):
         if not self.isVisible():
@@ -420,39 +810,25 @@ class MainWindow(QMainWindow):
         app_font = QFont(self.font())
         app_font.setPointSize(self.config.font_size)
         self.setFont(app_font)
-        self._configure_tile_list()
+        self._render_sections()
 
     def _tile_icon_size(self):
         return max(32, int(self.config.icon_size))
 
     def _tile_grid_size(self):
         icon_size = self._tile_icon_size()
-        metrics = self.list_widget.fontMetrics()
-        text_height = max(24, metrics.lineSpacing() * 2)
+        metrics = self.fontMetrics()
+        text_height = max(24, metrics.lineSpacing())
         width = max(100, icon_size + 24)
-        height = max(80, icon_size + text_height + 12)
+        height = max(82, icon_size + text_height + 12)
         return QSize(width, height)
-
-    def _configure_tile_list(self):
-        icon_size = self._tile_icon_size()
-        grid_size = self._tile_grid_size()
-        self.list_widget.setIconSize(QSize(icon_size, icon_size))
-        self.list_widget.setGridSize(grid_size)
-        self.list_widget.setSpacing(6)
-        self._update_tile_reorder_state()
-
-    def _grid_column_count(self):
-        grid_width = self.list_widget.gridSize().width()
-        if grid_width <= 0:
-            return 1
-        viewport_width = max(1, self.list_widget.viewport().width())
-        return max(1, viewport_width // grid_width)
 
     def showEvent(self, event):
         super().showEvent(event)
         if not self._initial_position_done:
             self._initial_position_done = True
             QTimer.singleShot(0, self.position_to_cursor)
+        QTimer.singleShot(0, self._refresh_section_heights)
 
     def event(self, event):
         if event.type() == QEvent.Type.WindowDeactivate and not self._suspend_auto_hide:
@@ -461,19 +837,11 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, watched, event):
         if watched is self.search_input and event.type() == QEvent.Type.KeyPress:
-            if event.key() == Qt.Key_Down:
-                self._step_selection(self._grid_column_count())
-                event.accept()
-                return True
-            if event.key() == Qt.Key_Up:
-                self._step_selection(-self._grid_column_count())
-                event.accept()
-                return True
-            if event.key() == Qt.Key_Right:
+            if event.key() in (Qt.Key_Down, Qt.Key_Right):
                 self.select_next_item()
                 event.accept()
                 return True
-            if event.key() == Qt.Key_Left:
+            if event.key() in (Qt.Key_Up, Qt.Key_Left):
                 self.select_previous_item()
                 event.accept()
                 return True
@@ -494,6 +862,7 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.surface.update()
+        QTimer.singleShot(0, self._refresh_section_heights)
 
     def position_to_cursor(self):
         screen = QGuiApplication.screenAt(QCursor.pos())
@@ -554,46 +923,150 @@ class MainWindow(QMainWindow):
             return True
         return query in entry.display_name.casefold()
 
-    def _render_entries(self, entries):
-        current_item = self.list_widget.currentItem()
-        current_path = None
-        if current_item is not None:
-            current_entry = current_item.data(Qt.UserRole)
-            if current_entry is not None:
-                current_path = str(current_entry.path)
+    def _ordered_entries_for_keys(self, item_keys, query):
+        entries = []
+        for key in item_keys:
+            entry = self._entry_map.get(key.casefold())
+            if entry is None:
+                continue
+            if not self._entry_matches_search(entry, query):
+                continue
+            entries.append(entry)
+        return entries
 
-        self.list_widget.clear()
-        grid_size = self._tile_grid_size()
+    def _update_status_for_groups(self, visible_count):
+        query = self.search_input.text().strip()
+        if query:
+            self.status_label.setText("已加载 {0} 项，匹配 {1} 项".format(len(self._all_entries), visible_count))
+            return
+        self.status_label.setText("已加载 {0} 项".format(len(self._all_entries)))
 
-        selected_row = 0
-        for index, entry in enumerate(entries):
-            item = QListWidgetItem(self._icon_for(entry.path), entry.display_name)
-            item.setData(Qt.UserRole, entry)
-            item.setToolTip(str(entry.path))
-            item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
-            item.setSizeHint(grid_size)
-            self.list_widget.addItem(item)
-            if current_path and str(entry.path) == current_path:
-                selected_row = index
+    def _ensure_section(self, group_id, title, editable, collapsible):
+        section = self._section_widgets.get(group_id)
+        if section is not None:
+            section.set_title(title)
+            return section
 
-        if entries:
-            self.list_widget.setCurrentRow(selected_row)
+        section = GroupSectionWidget(group_id, title, editable, collapsible)
+        section.toggle_requested.connect(self.toggle_group)
+        section.rename_requested.connect(self.rename_group)
+        section.delete_requested.connect(self.delete_group)
+        section.move_requested.connect(self.handle_move_request)
+        section.selection_changed.connect(self.handle_selection_changed)
+        section.item_activated.connect(self._open_item)
+        self._section_widgets[group_id] = section
+        return section
+
+    def _clear_sections(self):
+        while self.sections_layout.count():
+            item = self.sections_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        self._section_widgets = {}
+
+    def _render_sections(self):
+        query = self._search_query()
+        reorder_enabled = not query
+        visible_count = 0
+        self._visible_item_order = []
+        self._clear_sections()
+
+        root_entries = self._ordered_entries_for_keys(self.menu_layout.root_item_keys, query)
+        visible_count += len(root_entries)
+        root_section = self._ensure_section(ROOT_GROUP_ID, "未分类", editable=False, collapsible=False)
+        root_section.populate(
+            root_entries,
+            self._icon_for,
+            self._tile_icon_size(),
+            self._tile_grid_size(),
+            collapsed=False,
+            reorder_enabled=reorder_enabled,
+        )
+        self.sections_layout.addWidget(root_section)
+        self._visible_item_order.extend((ROOT_GROUP_ID, entry.entry_key) for entry in root_entries)
+
+        for group in self.menu_layout.groups:
+            group_entries = self._ordered_entries_for_keys(group.item_keys, query)
+            if query and not group_entries:
+                continue
+
+            visible_count += len(group_entries)
+            collapsed = False if query else group.collapsed
+            section = self._ensure_section(group.id, group.name, editable=True, collapsible=True)
+            section.populate(
+                group_entries,
+                self._icon_for,
+                self._tile_icon_size(),
+                self._tile_grid_size(),
+                collapsed=collapsed,
+                reorder_enabled=reorder_enabled,
+            )
+            self.sections_layout.addWidget(section)
+            self._visible_item_order.extend((group.id, entry.entry_key) for entry in group_entries)
+
+        self._update_status_for_groups(visible_count)
+        self._restore_or_select_first_visible()
+        QTimer.singleShot(0, self._refresh_section_heights)
+
+    def _refresh_section_heights(self):
+        for section in self._section_widgets.values():
+            section.tile_list.update_height_to_contents()
+
+    def _restore_or_select_first_visible(self):
+        if self._selected_entry_key is not None:
+            if self._set_current_selection(self._selected_group_id, self._selected_entry_key):
+                return
+        if self._visible_item_order:
+            group_id, entry_key = self._visible_item_order[0]
+            self._set_current_selection(group_id, entry_key)
+            return
+
+        self._selected_group_id = ROOT_GROUP_ID
+        self._selected_entry_key = None
+        for section in self._section_widgets.values():
+            section.clear_selection()
+
+    def _set_current_selection(self, group_id, entry_key):
+        selected = False
+        for current_group_id, section in self._section_widgets.items():
+            if current_group_id == group_id:
+                selected = section.set_selected_entry(entry_key) or selected
+            else:
+                section.clear_selection()
+
+        if selected:
+            self._selected_group_id = group_id
+            self._selected_entry_key = entry_key
+            section = self._section_widgets.get(group_id)
+            if section is not None:
+                section.scroll_selected_into_view()
+            return True
+        return False
+
+    def _current_item_index(self):
+        if self._selected_entry_key is None:
+            return -1
+        target = (self._selected_group_id, self._selected_entry_key)
+        try:
+            return self._visible_item_order.index(target)
+        except ValueError:
+            return -1
 
     def _step_selection(self, delta):
-        count = self.list_widget.count()
+        count = len(self._visible_item_order)
         if count <= 0:
             return
 
-        current_row = self.list_widget.currentRow()
-        if current_row < 0:
-            next_row = 0 if delta >= 0 else count - 1
+        current_index = self._current_item_index()
+        if current_index < 0:
+            next_index = 0 if delta >= 0 else count - 1
         else:
-            next_row = max(0, min(count - 1, current_row + delta))
+            next_index = max(0, min(count - 1, current_index + delta))
 
-        self.list_widget.setCurrentRow(next_row)
-        item = self.list_widget.currentItem()
-        if item is not None:
-            self.list_widget.scrollToItem(item)
+        group_id, entry_key = self._visible_item_order[next_index]
+        self._set_current_selection(group_id, entry_key)
 
     def select_next_item(self):
         self._step_selection(1)
@@ -601,25 +1074,27 @@ class MainWindow(QMainWindow):
     def select_previous_item(self):
         self._step_selection(-1)
 
-    def _update_status_for_entries(self, entries):
-        query = self.search_input.text().strip()
-        if query:
-            self.status_label.setText("已加载 {0} 项，匹配 {1} 项".format(len(self._all_entries), len(entries)))
-            return
-        self.status_label.setText("已加载 {0} 项".format(len(entries)))
+    def handle_selection_changed(self, group_id, entry_key):
+        self._selected_group_id = group_id
+        self._selected_entry_key = entry_key
+        for current_group_id, section in self._section_widgets.items():
+            if current_group_id == group_id:
+                continue
+            section.clear_selection()
 
     def _apply_search_filter(self):
-        query = self._search_query()
-        self._update_tile_reorder_state()
-        filtered_entries = [entry for entry in self._all_entries if self._entry_matches_search(entry, query)]
-        self._render_entries(filtered_entries)
-        self._update_status_for_entries(filtered_entries)
+        self._render_sections()
 
     def reload_items(self, clear_search=False):
         menu_dir = self._menu_dir()
         menu_dir.mkdir(parents=True, exist_ok=True)
-        self._all_entries = scan_menu_directory(menu_dir, self.config.tile_order)
-        self._sync_tile_order_with_entries()
+        self._all_entries = scan_menu_directory(menu_dir)
+        self._entry_map = {entry.entry_key.casefold(): entry for entry in self._all_entries}
+        if self.menu_layout.sync_with_entry_keys(
+            [entry.entry_key for entry in self._all_entries],
+            legacy_root_order=self.config.tile_order,
+        ):
+            self.config_store.save_menu_layout(self.menu_layout)
         self._apply_background_image()
 
         if clear_search and self.search_input.text():
@@ -627,74 +1102,134 @@ class MainWindow(QMainWindow):
             self.search_input.clear()
             self.search_input.blockSignals(False)
 
-        self._apply_search_filter()
+        self._render_sections()
 
-    def _update_tile_reorder_state(self):
-        allow_reorder = not self._search_query()
-        self.list_widget.setDragEnabled(allow_reorder)
-        self.list_widget.viewport().setAcceptDrops(allow_reorder)
-        self.list_widget.setAcceptDrops(allow_reorder)
-        self.list_widget.setDropIndicatorShown(allow_reorder)
-        self.list_widget.setDragDropMode(
-            QAbstractItemView.InternalMove if allow_reorder else QAbstractItemView.NoDragDrop
+    def _group_item_keys(self, group_id):
+        if group_id in (None, "", ROOT_GROUP_ID):
+            return self.menu_layout.root_item_keys
+
+        group = self.menu_layout.group_by_id(group_id)
+        if group is None:
+            return None
+        return group.item_keys
+
+    def _group_name(self, group_id):
+        if group_id in (None, "", ROOT_GROUP_ID):
+            return "未分类"
+        group = self.menu_layout.group_by_id(group_id)
+        return group.name if group is not None else ""
+
+    def create_group(self):
+        name, accepted = QInputDialog.getText(self, "新建分类", "分类名称：", text="新分类")
+        if not accepted:
+            return
+
+        name = str(name or "").strip()
+        if not name:
+            return
+
+        group = MenuLayoutGroup(
+            id="group_" + uuid.uuid4().hex[:10],
+            name=name,
+            collapsed=False,
+            item_keys=[],
+        ).normalized()
+        self.menu_layout.groups.append(group)
+        self.config_store.save_menu_layout(self.menu_layout)
+        self._render_sections()
+
+    def rename_group(self, group_id):
+        group = self.menu_layout.group_by_id(group_id)
+        if group is None:
+            return
+
+        name, accepted = QInputDialog.getText(self, "重命名分类", "分类名称：", text=group.name)
+        if not accepted:
+            return
+
+        name = str(name or "").strip()
+        if not name or name == group.name:
+            return
+
+        group.name = name
+        self.config_store.save_menu_layout(self.menu_layout)
+        self._render_sections()
+
+    def delete_group(self, group_id):
+        group = self.menu_layout.group_by_id(group_id)
+        if group is None:
+            return
+
+        result = QMessageBox.question(
+            self,
+            "删除分类",
+            "删除分类“{0}”后，其中的磁贴会回到未分类。是否继续？".format(group.name),
         )
-        if allow_reorder:
-            self.list_widget.setDefaultDropAction(Qt.MoveAction)
+        if result != QMessageBox.StandardButton.Yes:
+            return
 
-    def _sync_tile_order_with_entries(self):
-        actual_keys = {entry.entry_key.casefold(): entry.entry_key for entry in self._all_entries}
-        normalized_order = []
-        seen = set()
+        for item_key in group.item_keys:
+            if item_key not in self.menu_layout.root_item_keys:
+                self.menu_layout.root_item_keys.append(item_key)
 
-        for key in self.config.tile_order:
-            folded = str(key or "").strip().casefold()
-            actual_key = actual_keys.get(folded)
-            if not actual_key or folded in seen:
-                continue
-            seen.add(folded)
-            normalized_order.append(actual_key)
+        self.menu_layout.groups = [item for item in self.menu_layout.groups if item.id != group.id]
+        self.config_store.save_menu_layout(self.menu_layout)
+        self._render_sections()
 
-        for entry in self._all_entries:
-            folded = entry.entry_key.casefold()
-            if folded in seen:
-                continue
-            seen.add(folded)
-            normalized_order.append(entry.entry_key)
+    def toggle_group(self, group_id):
+        group = self.menu_layout.group_by_id(group_id)
+        if group is None:
+            return
 
-        if normalized_order != self.config.tile_order:
-            self.config.tile_order = normalized_order
-            self.config_store.save(self.config)
+        group.collapsed = not group.collapsed
+        self.config_store.save_menu_layout(self.menu_layout)
+        self._render_sections()
 
-    def _save_tile_order(self):
+    def handle_move_request(self, item_key, source_group_id, target_group_id, target_row):
         if self._search_query():
             return
 
-        tile_order = []
-        for index in range(self.list_widget.count()):
-            item = self.list_widget.item(index)
-            entry = item.data(Qt.UserRole)
-            if entry is None:
-                continue
-            tile_order.append(entry.entry_key)
+        source_keys = self._group_item_keys(source_group_id)
+        target_keys = self._group_item_keys(target_group_id)
+        if source_keys is None or target_keys is None:
+            return
 
-        if tile_order and tile_order != self.config.tile_order:
-            self.config.tile_order = tile_order
-            self.config_store.save(self.config)
+        try:
+            source_index = source_keys.index(item_key)
+        except ValueError:
+            return
+
+        source_keys.pop(source_index)
+        if source_keys is target_keys and target_row > source_index:
+            target_row -= 1
+
+        target_row = max(0, min(len(target_keys), int(target_row)))
+        target_keys.insert(target_row, item_key)
+        self.config_store.save_menu_layout(self.menu_layout)
+        self._selected_group_id = ROOT_GROUP_ID if target_group_id in (None, "", ROOT_GROUP_ID) else target_group_id
+        self._selected_entry_key = item_key
+        self._render_sections()
 
     def _icon_for(self, path):
         return self.icon_provider.icon(QFileInfo(str(path)))
 
     def _open_item(self, item):
-        entry = item.data(Qt.UserRole)
+        if isinstance(item, QListWidgetItem):
+            entry = item.data(Qt.UserRole)
+        else:
+            entry = item
         if entry is None:
             return
         self._open_entry(entry)
 
     def open_selected(self):
-        item = self.list_widget.currentItem()
-        if item is None:
+        if self._selected_entry_key is None:
             return
-        self._open_item(item)
+
+        entry = self._entry_map.get(str(self._selected_entry_key).casefold())
+        if entry is None:
+            return
+        self._open_entry(entry)
 
     def _open_entry(self, entry):
         try:
