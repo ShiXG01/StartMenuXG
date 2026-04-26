@@ -97,6 +97,7 @@ def build_stylesheet(theme, surface_opacity):
     launcher_button_hover = _hex_to_rgba(theme.button_hover, int(255 * 0.84 * alpha))
     launcher_button_pressed = _hex_to_rgba(theme.button_pressed, int(255 * 0.90 * alpha))
     launcher_selected_bg = _hex_to_rgba(theme.selected_bg, int(255 * 0.88 * alpha))
+    launcher_hover_bg = _hex_to_rgba(theme.button_hover, int(255 * 0.58 * alpha))
 
     return """
         QMainWindow, QDialog {{
@@ -125,11 +126,18 @@ def build_stylesheet(theme, surface_opacity):
         }}
         QListWidget#launcherList {{
             background: {launcher_panel_bg};
+            border-radius: 16px;
+            padding: 8px;
         }}
         QListWidget#launcherList::item {{
-            padding: 8px 10px;
-            border-radius: 6px;
+            padding: 6px 4px;
+            border-radius: 10px;
+            border: 1px solid transparent;
+            margin: 0;
             background: transparent;
+        }}
+        QListWidget#launcherList::item:hover {{
+            background: {launcher_hover_bg};
         }}
         QListWidget::item {{
             padding: 8px 10px;
@@ -141,6 +149,8 @@ def build_stylesheet(theme, surface_opacity):
         }}
         QListWidget#launcherList::item:selected {{
             background: {launcher_selected_bg};
+            border: 1px solid {border};
+            color: {selected_text};
         }}
         QLineEdit, QSpinBox, QComboBox {{
             background: {input_bg};
@@ -207,4 +217,5 @@ def build_stylesheet(theme, surface_opacity):
         launcher_button_hover=launcher_button_hover,
         launcher_button_pressed=launcher_button_pressed,
         launcher_selected_bg=launcher_selected_bg,
+        launcher_hover_bg=launcher_hover_bg,
     )

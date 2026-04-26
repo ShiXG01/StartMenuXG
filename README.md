@@ -4,10 +4,6 @@
 
 ---
 
-<img alt="img.png" src="images/img.png" title="效果图" width="300" height="360"/>
-
----
-
 ## 功能概览
 
 ### 1. 全局热键呼出

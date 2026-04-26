@@ -45,7 +45,7 @@ class SingleInstanceGuard:
 def _show_already_running_warning():
     message = "程序已启动\n程序已启"
     if sys.platform.startswith("win"):
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32 = ctypes.WinDLL( "user32", use_last_error=True)
         user32.MessageBoxW(
             None,
             message,

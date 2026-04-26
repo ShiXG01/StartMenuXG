@@ -6,6 +6,7 @@ from PySide6.QtCore import QFileInfo, QEvent, QTimer, Qt, QSize, Signal
 from PySide6.QtGui import (
     QColor,
     QCursor,
+    QDrag,
     QFont,
     QGuiApplication,
     QKeySequence,
@@ -15,10 +16,12 @@ from PySide6.QtGui import (
     QShortcut,
 )
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QDialog,
     QFileIconProvider,
     QLineEdit,
+    QListView,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -108,6 +111,111 @@ class BackgroundSurface(QWidget):
         painter.drawPath(path)
 
 
+class LauncherListWidget(QListWidget):
+    items_reordered = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._drag_row = -1
+
+    def startDrag(self, supported_actions):
+        del supported_actions
+        item = self.currentItem()
+        if item is None:
+            return
+
+        self._drag_row = self.currentRow()
+        mime_data = self.mimeData(self.selectedItems())
+        if mime_data is None:
+            self._drag_row = -1
+            return
+
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+
+        item_rect = self.visualItemRect(item)
+        if item_rect.isValid():
+            drag.setPixmap(self.viewport().grab(item_rect))
+            cursor_pos = self.viewport().mapFromGlobal(QCursor.pos())
+            drag.setHotSpot(cursor_pos - item_rect.topLeft())
+
+        drag.exec(Qt.MoveAction)
+        self._drag_row = -1
+
+    def dragEnterEvent(self, event):
+        if event.source() is self:
+            event.setDropAction(Qt.MoveAction)
+            event.accept()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if event.source() is self:
+            event.setDropAction(Qt.MoveAction)
+            event.accept()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        if event.source() is self and self._drag_row >= 0:
+            target_row = self._drop_insert_row(event.position().toPoint())
+            source_row = self._drag_row
+            if target_row > source_row:
+                target_row -= 1
+
+            if target_row != source_row:
+                item = self.takeItem(source_row)
+                self.insertItem(target_row, item)
+                self.setCurrentRow(target_row)
+                self.viewport().update()
+            event.setDropAction(Qt.MoveAction)
+            event.accept()
+            self.items_reordered.emit()
+            self._drag_row = -1
+            return
+
+        super().dropEvent(event)
+        self.items_reordered.emit()
+
+    def _drop_insert_row(self, pos):
+        count = self.count()
+        if count <= 0:
+            return 0
+
+        first_rect = self.visualItemRect(self.item(0))
+        grid_size = self.gridSize()
+        cell_width = max(1, grid_size.width())
+        cell_height = max(1, grid_size.height())
+        origin_x = first_rect.left()
+        origin_y = first_rect.top()
+        relative_x = pos.x() - origin_x
+        relative_y = pos.y() - origin_y
+
+        if relative_y < 0:
+            return 0
+
+        column_count = self._column_count_for_drop(cell_width, origin_x)
+        row_index = max(0, relative_y // cell_height)
+
+        if relative_x < 0:
+            column_index = 0
+            insert_after = False
+        else:
+            column_index = min(column_count - 1, relative_x // cell_width)
+            insert_after = (relative_x % cell_width) >= (cell_width / 2)
+
+        insert_row = row_index * column_count + column_index
+        if insert_after:
+            insert_row += 1
+
+        return max(0, min(count, int(insert_row)))
+
+    def _column_count_for_drop(self, cell_width, origin_x):
+        viewport_width = max(1, self.viewport().width())
+        usable_width = max(cell_width, viewport_width - max(0, origin_x))
+        return max(1, usable_width // cell_width)
+
+
 class MainWindow(QMainWindow):
     hotkey_triggered = Signal()
     dismiss_requested = Signal()
@@ -167,11 +275,24 @@ class MainWindow(QMainWindow):
         self.search_input.returnPressed.connect(self.open_selected)
         root_layout.addWidget(self.search_input)
 
-        self.list_widget = QListWidget()
+        self.list_widget = LauncherListWidget()
         self.list_widget.setObjectName("launcherList")
         self.list_widget.setAlternatingRowColors(False)
-        self.list_widget.setIconSize(QSize(self.config.icon_size, self.config.icon_size))
+        self.list_widget.setViewMode(QListView.IconMode)
+        self.list_widget.setFlow(QListView.LeftToRight)
+        self.list_widget.setMovement(QListView.Static)
+        self.list_widget.setResizeMode(QListView.Adjust)
+        self.list_widget.setWrapping(True)
+        self.list_widget.setWordWrap(True)
+        self.list_widget.setUniformItemSizes(True)
+        self.list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.list_widget.setDragDropOverwriteMode(False)
+        self.list_widget.setDropIndicatorShown(True)
+        self.list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.list_widget.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.list_widget.setTextElideMode(Qt.ElideRight)
         self.list_widget.itemActivated.connect(self._open_item)
+        self.list_widget.items_reordered.connect(self._save_tile_order)
         root_layout.addWidget(self.list_widget, 1)
 
         button_row = QHBoxLayout()
@@ -209,6 +330,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Escape"), self, activated=self.hide_launcher)
         QShortcut(QKeySequence("F5"), self, activated=self.reload_items)
         self.setCentralWidget(self.surface)
+        self._configure_tile_list()
 
     def _contains_global_point(self, x, y):
         if not self.isVisible():
@@ -298,7 +420,33 @@ class MainWindow(QMainWindow):
         app_font = QFont(self.font())
         app_font.setPointSize(self.config.font_size)
         self.setFont(app_font)
-        self.list_widget.setIconSize(QSize(self.config.icon_size, self.config.icon_size))
+        self._configure_tile_list()
+
+    def _tile_icon_size(self):
+        return max(32, int(self.config.icon_size))
+
+    def _tile_grid_size(self):
+        icon_size = self._tile_icon_size()
+        metrics = self.list_widget.fontMetrics()
+        text_height = max(24, metrics.lineSpacing() * 2)
+        width = max(100, icon_size + 24)
+        height = max(80, icon_size + text_height + 12)
+        return QSize(width, height)
+
+    def _configure_tile_list(self):
+        icon_size = self._tile_icon_size()
+        grid_size = self._tile_grid_size()
+        self.list_widget.setIconSize(QSize(icon_size, icon_size))
+        self.list_widget.setGridSize(grid_size)
+        self.list_widget.setSpacing(6)
+        self._update_tile_reorder_state()
+
+    def _grid_column_count(self):
+        grid_width = self.list_widget.gridSize().width()
+        if grid_width <= 0:
+            return 1
+        viewport_width = max(1, self.list_widget.viewport().width())
+        return max(1, viewport_width // grid_width)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -314,10 +462,18 @@ class MainWindow(QMainWindow):
     def eventFilter(self, watched, event):
         if watched is self.search_input and event.type() == QEvent.Type.KeyPress:
             if event.key() == Qt.Key_Down:
-                self.select_next_item()
+                self._step_selection(self._grid_column_count())
                 event.accept()
                 return True
             if event.key() == Qt.Key_Up:
+                self._step_selection(-self._grid_column_count())
+                event.accept()
+                return True
+            if event.key() == Qt.Key_Right:
+                self.select_next_item()
+                event.accept()
+                return True
+            if event.key() == Qt.Key_Left:
                 self.select_previous_item()
                 event.accept()
                 return True
@@ -407,12 +563,15 @@ class MainWindow(QMainWindow):
                 current_path = str(current_entry.path)
 
         self.list_widget.clear()
+        grid_size = self._tile_grid_size()
 
         selected_row = 0
         for index, entry in enumerate(entries):
             item = QListWidgetItem(self._icon_for(entry.path), entry.display_name)
             item.setData(Qt.UserRole, entry)
             item.setToolTip(str(entry.path))
+            item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
+            item.setSizeHint(grid_size)
             self.list_widget.addItem(item)
             if current_path and str(entry.path) == current_path:
                 selected_row = index
@@ -451,6 +610,7 @@ class MainWindow(QMainWindow):
 
     def _apply_search_filter(self):
         query = self._search_query()
+        self._update_tile_reorder_state()
         filtered_entries = [entry for entry in self._all_entries if self._entry_matches_search(entry, query)]
         self._render_entries(filtered_entries)
         self._update_status_for_entries(filtered_entries)
@@ -458,7 +618,8 @@ class MainWindow(QMainWindow):
     def reload_items(self, clear_search=False):
         menu_dir = self._menu_dir()
         menu_dir.mkdir(parents=True, exist_ok=True)
-        self._all_entries = scan_menu_directory(menu_dir)
+        self._all_entries = scan_menu_directory(menu_dir, self.config.tile_order)
+        self._sync_tile_order_with_entries()
         self._apply_background_image()
 
         if clear_search and self.search_input.text():
@@ -467,6 +628,58 @@ class MainWindow(QMainWindow):
             self.search_input.blockSignals(False)
 
         self._apply_search_filter()
+
+    def _update_tile_reorder_state(self):
+        allow_reorder = not self._search_query()
+        self.list_widget.setDragEnabled(allow_reorder)
+        self.list_widget.viewport().setAcceptDrops(allow_reorder)
+        self.list_widget.setAcceptDrops(allow_reorder)
+        self.list_widget.setDropIndicatorShown(allow_reorder)
+        self.list_widget.setDragDropMode(
+            QAbstractItemView.InternalMove if allow_reorder else QAbstractItemView.NoDragDrop
+        )
+        if allow_reorder:
+            self.list_widget.setDefaultDropAction(Qt.MoveAction)
+
+    def _sync_tile_order_with_entries(self):
+        actual_keys = {entry.entry_key.casefold(): entry.entry_key for entry in self._all_entries}
+        normalized_order = []
+        seen = set()
+
+        for key in self.config.tile_order:
+            folded = str(key or "").strip().casefold()
+            actual_key = actual_keys.get(folded)
+            if not actual_key or folded in seen:
+                continue
+            seen.add(folded)
+            normalized_order.append(actual_key)
+
+        for entry in self._all_entries:
+            folded = entry.entry_key.casefold()
+            if folded in seen:
+                continue
+            seen.add(folded)
+            normalized_order.append(entry.entry_key)
+
+        if normalized_order != self.config.tile_order:
+            self.config.tile_order = normalized_order
+            self.config_store.save(self.config)
+
+    def _save_tile_order(self):
+        if self._search_query():
+            return
+
+        tile_order = []
+        for index in range(self.list_widget.count()):
+            item = self.list_widget.item(index)
+            entry = item.data(Qt.UserRole)
+            if entry is None:
+                continue
+            tile_order.append(entry.entry_key)
+
+        if tile_order and tile_order != self.config.tile_order:
+            self.config.tile_order = tile_order
+            self.config_store.save(self.config)
 
     def _icon_for(self, path):
         return self.icon_provider.icon(QFileInfo(str(path)))

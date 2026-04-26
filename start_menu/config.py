@@ -1,6 +1,6 @@
 import json
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from start_menu.hotkey import DEFAULT_HOTKEY_TEXT, normalize_hotkey_text
@@ -25,8 +25,9 @@ class AppConfig:
     font_size: int = 10
     window_width: int = 520
     window_height: int = 620
-    icon_size: int = 18
+    icon_size: int = 40
     edge_margin: int = 14
+    tile_order: list = field(default_factory=list)
 
     def normalized(self):
         self.menu_dir = str(self.menu_dir or "").strip()
@@ -36,8 +37,20 @@ class AppConfig:
         self.font_size = _clamp(int(self.font_size), 8, 28)
         self.window_width = _clamp(int(self.window_width), 360, 1200)
         self.window_height = _clamp(int(self.window_height), 320, 1200)
-        self.icon_size = _clamp(int(self.icon_size), 16, 48)
+        self.icon_size = _clamp(int(self.icon_size), 32, 96)
         self.edge_margin = _clamp(int(self.edge_margin), 0, 48)
+        if not isinstance(self.tile_order, list):
+            self.tile_order = []
+        normalized_order = []
+        seen = set()
+        for value in self.tile_order:
+            text = str(value or "").strip()
+            folded = text.casefold()
+            if not text or folded in seen:
+                continue
+            seen.add(folded)
+            normalized_order.append(text)
+        self.tile_order = normalized_order
         return self
 
 
@@ -114,6 +127,7 @@ class ConfigStore:
             window_height=payload.get("window_height", default_config.window_height),
             icon_size=payload.get("icon_size", default_config.icon_size),
             edge_margin=payload.get("edge_margin", default_config.edge_margin),
+            tile_order=payload.get("tile_order", default_config.tile_order),
         ).normalized()
 
         needs_save = False
