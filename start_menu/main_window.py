@@ -4,7 +4,7 @@ import sys
 import uuid
 from pathlib import Path
 
-from PySide6.QtCore import QFileInfo, QEvent, QTimer, Qt, QSize, Signal
+from PySide6.QtCore import QFileInfo, QEvent, QMimeData, QTimer, Qt, QSize, Signal
 from PySide6.QtGui import (
     QColor,
     QCursor,
@@ -21,10 +21,10 @@ from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
     QDialog,
+    QDialogButtonBox,
     QFrame,
     QFileIconProvider,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QListView,
@@ -47,6 +47,7 @@ from start_menu.theme import build_stylesheet, get_system_theme
 
 IS_WINDOWS = sys.platform.startswith("win")
 MIME_TILE = "application/x-startmenuxg-tile"
+MIME_GROUP = "application/x-startmenuxg-group"
 ROOT_GROUP_ID = "@root"
 
 if IS_WINDOWS:
@@ -83,6 +84,34 @@ def _decode_drag_payload(mime_data):
     if not item_key:
         return None
     return item_key, source_group_id
+
+
+def _encode_group_drag_payload(group_id):
+    payload = {
+        "group_id": str(group_id or "").strip(),
+    }
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def _decode_group_drag_payload(mime_data):
+    if not mime_data.hasFormat(MIME_GROUP):
+        return None
+
+    try:
+        payload = json.loads(bytes(mime_data.data(MIME_GROUP)).decode("utf-8"))
+    except (ValueError, TypeError, UnicodeDecodeError):
+        return None
+
+    group_id = str(payload.get("group_id", "")).strip()
+    if not group_id:
+        return None
+    return group_id
+
+
+def _invisible_drag_pixmap():
+    pixmap = QPixmap(1, 1)
+    pixmap.fill(Qt.transparent)
+    return pixmap
 
 
 class BackgroundSurface(QWidget):
@@ -143,6 +172,94 @@ class BackgroundSurface(QWidget):
         painter.drawPath(path)
 
 
+class DeferredTextInputDialog(QDialog):
+    def __init__(self, title, label, initial_text="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(True)
+        self.setMinimumWidth(360)
+        self._typing_target = QLineEdit(initial_text)
+
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(16, 16, 16, 16)
+        root_layout.setSpacing(12)
+
+        helper = QLabel(label)
+        root_layout.addWidget(helper)
+        root_layout.addWidget(self._typing_target)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root_layout.addWidget(buttons)
+
+        self.setFocusPolicy(Qt.StrongFocus)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.activateWindow()
+        self.setFocus(Qt.ActiveWindowFocusReason)
+
+    def text_value(self):
+        return self._typing_target.text().strip()
+
+    def keyPressEvent(self, event):
+        if self._typing_target.hasFocus():
+            super().keyPressEvent(event)
+            return
+
+        modifiers = event.modifiers()
+        text = event.text()
+        is_plain_text = bool(text) and text.isprintable() and not (modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))
+
+        if is_plain_text:
+            self._typing_target.setFocus(Qt.ActiveWindowFocusReason)
+            self._typing_target.insert(text)
+            event.accept()
+            return
+
+        if event.key() == Qt.Key_Backspace:
+            self._typing_target.setFocus(Qt.ActiveWindowFocusReason)
+            event.accept()
+            return
+
+        super().keyPressEvent(event)
+
+
+class WindowDragBar(QWidget):
+    drag_started = Signal(object)
+    drag_moved = Signal(object)
+    drag_finished = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("windowDragBar")
+        self.setCursor(Qt.OpenHandCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.setCursor(Qt.ClosedHandCursor)
+            self.drag_started.emit(event.globalPosition().toPoint())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.LeftButton:
+            self.drag_moved.emit(event.globalPosition().toPoint())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.setCursor(Qt.OpenHandCursor)
+            self.drag_finished.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class LauncherListWidget(QListWidget):
     move_requested = Signal(str, object, object, int)
     selection_changed = Signal(object, str)
@@ -164,7 +281,7 @@ class LauncherListWidget(QListWidget):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setTextElideMode(Qt.ElideRight)
-        self.setFocusPolicy(Qt.NoFocus)
+        self.setFocusPolicy(Qt.StrongFocus)
         self.setSelectionMode(QAbstractItemView.SingleSelection)
         self.setDragEnabled(True)
         self.viewport().setAcceptDrops(True)
@@ -203,12 +320,7 @@ class LauncherListWidget(QListWidget):
 
         drag = QDrag(self)
         drag.setMimeData(mime_data)
-
-        item_rect = self.visualItemRect(item)
-        if item_rect.isValid():
-            drag.setPixmap(self.viewport().grab(item_rect))
-            cursor_pos = self.viewport().mapFromGlobal(QCursor.pos())
-            drag.setHotSpot(cursor_pos - item_rect.topLeft())
+        drag.setPixmap(_invisible_drag_pixmap())
 
         drag.exec(Qt.MoveAction)
 
@@ -309,6 +421,7 @@ class GroupHeaderWidget(QWidget):
     rename_requested = Signal(object)
     delete_requested = Signal(object)
     move_requested = Signal(str, object, object, int)
+    reorder_requested = Signal(object, object, bool)
 
     def __init__(self, group_id, editable, collapsible, parent=None):
         super().__init__(parent)
@@ -317,6 +430,7 @@ class GroupHeaderWidget(QWidget):
         self.collapsible = collapsible
         self._reorder_enabled = True
         self._item_count = 0
+        self._drag_start_pos = None
         self.setObjectName("groupHeader")
         self.setAcceptDrops(True)
 
@@ -333,10 +447,12 @@ class GroupHeaderWidget(QWidget):
 
         self.title_label = QLabel()
         self.title_label.setObjectName("groupTitleLabel")
+        self.title_label.setCursor(Qt.OpenHandCursor if self.editable else Qt.ArrowCursor)
         layout.addWidget(self.title_label, 1)
 
         self.count_label = QLabel()
         self.count_label.setObjectName("groupCountLabel")
+        self.count_label.setCursor(Qt.OpenHandCursor if self.editable else Qt.ArrowCursor)
         layout.addWidget(self.count_label)
 
         self.rename_button = QPushButton("重命名")
@@ -377,16 +493,27 @@ class GroupHeaderWidget(QWidget):
         self._reorder_enabled = bool(enabled)
 
     def dragEnterEvent(self, event):
+        if self._accept_group_drag_event(event):
+            return
         if self._accept_drag_event(event):
             return
         super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event):
+        if self._accept_group_drag_event(event):
+            return
         if self._accept_drag_event(event):
             return
         super().dragMoveEvent(event)
 
     def dropEvent(self, event):
+        source_group_id = _decode_group_drag_payload(event.mimeData())
+        if self._can_accept_group_drop(source_group_id):
+            self.reorder_requested.emit(source_group_id, self.group_id, self._insert_after_for_pos(event.position().toPoint().y()))
+            event.setDropAction(Qt.MoveAction)
+            event.accept()
+            return
+
         payload = _decode_drag_payload(event.mimeData())
         if self._reorder_enabled and payload is not None:
             item_key, source_group_id = payload
@@ -404,6 +531,32 @@ class GroupHeaderWidget(QWidget):
             self.rename_button,
             self.delete_button,
         ):
+            if watched in (self.title_label, self.count_label):
+                if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.LeftButton:
+                    self._drag_start_pos = watched.mapTo(self, event.position().toPoint())
+                    return False
+                if event.type() == QEvent.Type.MouseMove and self._should_start_group_drag(watched.mapTo(self, event.position().toPoint()), event.buttons()):
+                    return True
+                if event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.LeftButton:
+                    self._drag_start_pos = None
+                    return False
+
+            if event.type() == QEvent.Type.DragEnter and self._accept_group_drag_event(event):
+                return True
+            if event.type() == QEvent.Type.DragMove and self._accept_group_drag_event(event):
+                return True
+            if event.type() == QEvent.Type.Drop:
+                source_group_id = _decode_group_drag_payload(event.mimeData())
+                if self._can_accept_group_drop(source_group_id):
+                    self.reorder_requested.emit(
+                        source_group_id,
+                        self.group_id,
+                        self._insert_after_for_pos(watched.mapTo(self, event.position().toPoint()).y()),
+                    )
+                    event.setDropAction(Qt.MoveAction)
+                    event.accept()
+                    return True
+
             if event.type() == QEvent.Type.DragEnter and self._accept_drag_event(event):
                 return True
             if event.type() == QEvent.Type.DragMove and self._accept_drag_event(event):
@@ -426,9 +579,67 @@ class GroupHeaderWidget(QWidget):
             return True
         return False
 
+    def _accept_group_drag_event(self, event):
+        source_group_id = _decode_group_drag_payload(event.mimeData())
+        if self._can_accept_group_drop(source_group_id):
+            event.setDropAction(Qt.MoveAction)
+            event.accept()
+            return True
+        return False
+
+    def _can_accept_group_drop(self, source_group_id):
+        source_group_id = str(source_group_id or "").strip()
+        if not self.editable or not source_group_id:
+            return False
+        if source_group_id == ROOT_GROUP_ID:
+            return False
+        return source_group_id != self.group_id
+
+    def _insert_after_for_pos(self, y_pos):
+        return y_pos >= max(1, self.height()) / 2
+
+    def _can_drag_group(self):
+        return self.editable and self.group_id != ROOT_GROUP_ID
+
+    def _should_start_group_drag(self, local_pos, buttons):
+        if not self._can_drag_group():
+            return False
+        if self._drag_start_pos is None or not (buttons & Qt.LeftButton):
+            return False
+        if (local_pos - self._drag_start_pos).manhattanLength() < QApplication.startDragDistance():
+            return False
+        self._start_group_drag(local_pos)
+        self._drag_start_pos = None
+        return True
+
+    def _start_group_drag(self, local_pos):
+        mime_data = QMimeData()
+        mime_data.setData(MIME_GROUP, _encode_group_drag_payload(self.group_id))
+
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+        drag.setPixmap(_invisible_drag_pixmap())
+        drag.exec(Qt.MoveAction)
+
     def _emit_toggle(self):
         if self.collapsible:
             self.toggle_requested.emit(self.group_id)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self._can_drag_group():
+            self._drag_start_pos = event.position().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._should_start_group_drag(event.position().toPoint(), event.buttons()):
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_start_pos = None
+        super().mouseReleaseEvent(event)
 
 
 class GroupSectionWidget(QWidget):
@@ -436,6 +647,7 @@ class GroupSectionWidget(QWidget):
     rename_requested = Signal(object)
     delete_requested = Signal(object)
     move_requested = Signal(str, object, object, int)
+    reorder_requested = Signal(object, object, bool)
     selection_changed = Signal(object, str)
     item_activated = Signal(object)
 
@@ -462,6 +674,13 @@ class GroupSectionWidget(QWidget):
                 source_group_id,
                 target_group_id,
                 target_row,
+            )
+        )
+        self.header.reorder_requested.connect(
+            lambda source_group_id, target_group_id, insert_after: self.reorder_requested.emit(
+                source_group_id,
+                target_group_id,
+                insert_after,
             )
         )
         layout.addWidget(self.header)
@@ -647,11 +866,17 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(18, 18, 18, 18)
         root_layout.setSpacing(10)
 
-        top_row = QHBoxLayout()
+        self.drag_bar = WindowDragBar()
+        self.drag_bar.drag_started.connect(self._start_window_drag)
+        self.drag_bar.drag_moved.connect(self._move_window_drag)
+        self.drag_bar.drag_finished.connect(self._finish_window_drag)
+        top_row = QHBoxLayout(self.drag_bar)
+        top_row.setContentsMargins(0, 0, 0, 0)
         top_row.setSpacing(8)
 
         self.status_label = QLabel("已加载 0 项")
         self.status_label.setObjectName("statusLabel")
+        self.status_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         top_row.addWidget(self.status_label, 1)
 
         new_group_button = QPushButton("新建分类")
@@ -659,7 +884,7 @@ class MainWindow(QMainWindow):
         new_group_button.clicked.connect(self.create_group)
         top_row.addWidget(new_group_button)
 
-        root_layout.addLayout(top_row)
+        root_layout.addWidget(self.drag_bar)
 
         self.search_input = QLineEdit()
         self.search_input.setObjectName("launcherSearchInput")
@@ -703,11 +928,6 @@ class MainWindow(QMainWindow):
         settings_button.setProperty("surfaceRole", "launcher")
         settings_button.clicked.connect(self.open_settings)
         button_row.addWidget(settings_button)
-
-        open_project_button = QPushButton("打开项目")
-        open_project_button.setProperty("surfaceRole", "launcher")
-        open_project_button.clicked.connect(self.open_project_directory)
-        button_row.addWidget(open_project_button)
 
         exit_button = QPushButton("退出")
         exit_button.setProperty("surfaceRole", "launcher")
@@ -952,59 +1172,80 @@ class MainWindow(QMainWindow):
         section.rename_requested.connect(self.rename_group)
         section.delete_requested.connect(self.delete_group)
         section.move_requested.connect(self.handle_move_request)
+        section.reorder_requested.connect(self.handle_group_reorder_request)
         section.selection_changed.connect(self.handle_selection_changed)
         section.item_activated.connect(self._open_item)
         self._section_widgets[group_id] = section
         return section
 
-    def _clear_sections(self):
+    def _clear_section_layout(self):
         while self.sections_layout.count():
             item = self.sections_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
-                widget.setParent(None)
-                widget.deleteLater()
-        self._section_widgets = {}
+                widget.hide()
+
+    def _remove_deleted_sections(self, valid_group_ids):
+        stale_group_ids = [group_id for group_id in self._section_widgets if group_id not in valid_group_ids]
+        for group_id in stale_group_ids:
+            section = self._section_widgets.pop(group_id)
+            self.sections_layout.removeWidget(section)
+            section.hide()
+            section.deleteLater()
 
     def _render_sections(self):
         query = self._search_query()
         reorder_enabled = not query
         visible_count = 0
         self._visible_item_order = []
-        self._clear_sections()
+        visible_sections = []
+        valid_group_ids = {ROOT_GROUP_ID}
+        valid_group_ids.update(group.id for group in self.menu_layout.groups)
 
-        root_entries = self._ordered_entries_for_keys(self.menu_layout.root_item_keys, query)
-        visible_count += len(root_entries)
-        root_section = self._ensure_section(ROOT_GROUP_ID, "未分类", editable=False, collapsible=False)
-        root_section.populate(
-            root_entries,
-            self._icon_for,
-            self._tile_icon_size(),
-            self._tile_grid_size(),
-            collapsed=False,
-            reorder_enabled=reorder_enabled,
-        )
-        self.sections_layout.addWidget(root_section)
-        self._visible_item_order.extend((ROOT_GROUP_ID, entry.entry_key) for entry in root_entries)
+        self.sections_container.setUpdatesEnabled(False)
+        try:
+            self._remove_deleted_sections(valid_group_ids)
 
-        for group in self.menu_layout.groups:
-            group_entries = self._ordered_entries_for_keys(group.item_keys, query)
-            if query and not group_entries:
-                continue
+            for group in self.menu_layout.groups:
+                group_entries = self._ordered_entries_for_keys(group.item_keys, query)
+                if query and not group_entries:
+                    continue
 
-            visible_count += len(group_entries)
-            collapsed = False if query else group.collapsed
-            section = self._ensure_section(group.id, group.name, editable=True, collapsible=True)
-            section.populate(
-                group_entries,
+                visible_count += len(group_entries)
+                collapsed = False if query else group.collapsed
+                section = self._ensure_section(group.id, group.name, editable=True, collapsible=True)
+                section.populate(
+                    group_entries,
+                    self._icon_for,
+                    self._tile_icon_size(),
+                    self._tile_grid_size(),
+                    collapsed=collapsed,
+                    reorder_enabled=reorder_enabled,
+                )
+                visible_sections.append(section)
+                self._visible_item_order.extend((group.id, entry.entry_key) for entry in group_entries)
+
+            root_entries = self._ordered_entries_for_keys(self.menu_layout.root_item_keys, query)
+            visible_count += len(root_entries)
+            root_section = self._ensure_section(ROOT_GROUP_ID, "未分类", editable=False, collapsible=False)
+            root_section.populate(
+                root_entries,
                 self._icon_for,
                 self._tile_icon_size(),
                 self._tile_grid_size(),
-                collapsed=collapsed,
+                collapsed=False,
                 reorder_enabled=reorder_enabled,
             )
-            self.sections_layout.addWidget(section)
-            self._visible_item_order.extend((group.id, entry.entry_key) for entry in group_entries)
+            visible_sections.append(root_section)
+            self._visible_item_order.extend((ROOT_GROUP_ID, entry.entry_key) for entry in root_entries)
+
+            self._clear_section_layout()
+            for section in visible_sections:
+                self.sections_layout.addWidget(section)
+                section.show()
+        finally:
+            self.sections_container.setUpdatesEnabled(True)
+            self.sections_container.update()
 
         self._update_status_for_groups(visible_count)
         self._restore_or_select_first_visible()
@@ -1120,11 +1361,11 @@ class MainWindow(QMainWindow):
         return group.name if group is not None else ""
 
     def create_group(self):
-        name, accepted = QInputDialog.getText(self, "新建分类", "分类名称：", text="新分类")
-        if not accepted:
+        dialog = DeferredTextInputDialog("新建分类", "分类名称：", "新分类", self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        name = str(name or "").strip()
+        name = dialog.text_value()
         if not name:
             return
 
@@ -1143,11 +1384,11 @@ class MainWindow(QMainWindow):
         if group is None:
             return
 
-        name, accepted = QInputDialog.getText(self, "重命名分类", "分类名称：", text=group.name)
-        if not accepted:
+        dialog = DeferredTextInputDialog("重命名分类", "分类名称：", group.name, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        name = str(name or "").strip()
+        name = dialog.text_value()
         if not name or name == group.name:
             return
 
@@ -1210,6 +1451,37 @@ class MainWindow(QMainWindow):
         self._selected_entry_key = item_key
         self._render_sections()
 
+    def handle_group_reorder_request(self, source_group_id, target_group_id, insert_after):
+        source_group_id = str(source_group_id or "").strip()
+        target_group_id = str(target_group_id or "").strip()
+        if not source_group_id or not target_group_id:
+            return
+        if source_group_id == target_group_id:
+            return
+        if ROOT_GROUP_ID in (source_group_id, target_group_id):
+            return
+
+        source_index = -1
+        target_index = -1
+        for index, group in enumerate(self.menu_layout.groups):
+            if group.id == source_group_id:
+                source_index = index
+            if group.id == target_group_id:
+                target_index = index
+
+        if source_index < 0 or target_index < 0:
+            return
+
+        group = self.menu_layout.groups.pop(source_index)
+        if source_index < target_index:
+            target_index -= 1
+        if insert_after:
+            target_index += 1
+        target_index = max(0, min(len(self.menu_layout.groups), target_index))
+        self.menu_layout.groups.insert(target_index, group)
+        self.config_store.save_menu_layout(self.menu_layout)
+        self._render_sections()
+
     def _icon_for(self, path):
         return self.icon_provider.icon(QFileInfo(str(path)))
 
@@ -1243,12 +1515,6 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             QMessageBox.warning(self, "打开目录失败", str(exc))
 
-    def open_project_directory(self):
-        try:
-            open_path(self.config_store.project_root)
-        except OSError as exc:
-            QMessageBox.warning(self, "打开项目失败", str(exc))
-
     def _focus_launcher(self):
         self.raise_()
         self.activateWindow()
@@ -1262,28 +1528,20 @@ class MainWindow(QMainWindow):
             user32.SetForegroundWindow(hwnd)
             user32.SetActiveWindow(hwnd)
         self.setFocus(Qt.ActiveWindowFocusReason)
-        self.search_input.setFocus(Qt.ActiveWindowFocusReason)
+        current_section = self._section_widgets.get(self._selected_group_id)
+        if current_section is not None and current_section.tile_list.isVisible():
+            current_section.tile_list.setFocus(Qt.ActiveWindowFocusReason)
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            event.accept()
-            return
-        super().mousePressEvent(event)
+    def _start_window_drag(self, global_pos):
+        self._drag_offset = global_pos - self.frameGeometry().topLeft()
 
-    def mouseMoveEvent(self, event):
-        if self._drag_offset is not None and event.buttons() & Qt.LeftButton:
-            self.move(event.globalPosition().toPoint() - self._drag_offset)
-            event.accept()
+    def _move_window_drag(self, global_pos):
+        if self._drag_offset is None:
             return
-        super().mouseMoveEvent(event)
+        self.move(global_pos - self._drag_offset)
 
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._drag_offset = None
-            event.accept()
-            return
-        super().mouseReleaseEvent(event)
+    def _finish_window_drag(self):
+        self._drag_offset = None
 
     def show_launcher(self):
         self.reload_items(clear_search=True)
@@ -1334,4 +1592,41 @@ class MainWindow(QMainWindow):
             self.hide_launcher()
             event.accept()
             return
+        if event.key() == Qt.Key_Down and not self.search_input.hasFocus():
+            self.select_next_item()
+            event.accept()
+            return
+        if event.key() == Qt.Key_Up and not self.search_input.hasFocus():
+            self.select_previous_item()
+            event.accept()
+            return
+        if event.key() == Qt.Key_Right and not self.search_input.hasFocus():
+            self.select_next_item()
+            event.accept()
+            return
+        if event.key() == Qt.Key_Left and not self.search_input.hasFocus():
+            self.select_previous_item()
+            event.accept()
+            return
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not self.search_input.hasFocus():
+            self.open_selected()
+            event.accept()
+            return
+
+        modifiers = event.modifiers()
+        text = event.text()
+        is_plain_text = bool(text) and text.isprintable() and not (modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))
+        if is_plain_text and not self.search_input.hasFocus():
+            self.search_input.setFocus(Qt.ActiveWindowFocusReason)
+            self.search_input.insert(text)
+            event.accept()
+            return
+
+        if event.key() == Qt.Key_Backspace and not self.search_input.hasFocus() and self.search_input.text():
+            self.search_input.setFocus(Qt.ActiveWindowFocusReason)
+            current_text = self.search_input.text()
+            self.search_input.setText(current_text[:-1])
+            event.accept()
+            return
+
         super().keyPressEvent(event)
